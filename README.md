@@ -2,6 +2,17 @@
 
 > **AI-powered documentation generator** — point it at any GitHub repository and it produces a rich, Language-Model-ready knowledge base that lets AI agents answer detailed debugging questions about the codebase.
 
+
+## Why Traverser?
+
+Onboarding to an unfamiliar codebase is slow. Reading raw source files gives you 
+syntax but not intent — you don't know why decisions were made, how modules 
+connect, or where to start when something breaks. Traverser solves this by 
+turning any GitHub repository into a structured knowledge base: rich markdown 
+docs that explain purpose, architecture, and debugging paths — ready to feed 
+into NotebookLM, GitHub Copilot, or any AI tool. What used to take days of 
+exploration takes minutes.
+
 ---
 
 ## What it does
