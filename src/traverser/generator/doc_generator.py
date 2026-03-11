@@ -6,9 +6,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from pathlib import PurePosixPath
+from typing import Callable
 
 import diskcache
 
@@ -16,6 +18,7 @@ from traverser.config import Config
 from traverser.generator.llm_provider import OpenAIProvider, AnthropicProvider, build_provider
 from traverser.generator.prompts import (
     build_architecture_prompt,
+    build_batch_brief_doc_prompt,
     build_brief_file_doc_prompt,
     build_copilot_instructions_prompt,
     build_debugging_guide_prompt,
@@ -38,6 +41,9 @@ logger = logging.getLogger(__name__)
 
 # Increment this when prompts change significantly to bust old caches
 _CACHE_VERSION = "v2"
+
+# Maximum number of BRIEF files bundled into a single LLM call
+_BRIEF_BATCH_SIZE = 8
 
 
 def _content_hash(text: str) -> str:
@@ -150,6 +156,88 @@ class DocGenerator:
 
         raw = await self._call_llm(prompt, cache_key)
         return _parse_file_doc(raw, file, self._provider.model_name, tier)
+
+    # ── Batch BRIEF documentation ─────────────────────────────────────────────
+
+    async def generate_brief_batch(
+        self,
+        files: list[FileNode],
+        analyses: dict[str, FileAnalysis],
+        relationships: ProjectRelationships,
+        on_batch_done: Callable[[int], None] | None = None,
+    ) -> dict[str, FileDocumentation]:
+        """Generate BRIEF docs for many files using batched LLM calls.
+
+        Files whose results are already cached are returned instantly.
+        Uncached files are grouped into batches of *_BRIEF_BATCH_SIZE* and
+        each batch is sent as a single LLM call.  Per-file sections of the
+        response are cached individually so future runs still benefit.
+        """
+        if not files:
+            return {}
+
+        results: dict[str, FileDocumentation] = {}
+        uncached: list[FileNode] = []
+
+        # 1. Return cached results immediately
+        for file in files:
+            cache_key = _file_doc_cache_key(file.sha + ":brief", self._provider.model_name)
+            cached = self._cache_get(cache_key)
+            if cached is not None:
+                results[file.path] = _parse_file_doc(
+                    cached, file, self._provider.model_name, DocTier.BRIEF
+                )
+            else:
+                uncached.append(file)
+
+        cached_count = len(files) - len(uncached)
+        if on_batch_done and cached_count:
+            on_batch_done(cached_count)
+
+        # 2. Batch uncached files into combined LLM calls
+        for i in range(0, len(uncached), _BRIEF_BATCH_SIZE):
+            batch = uncached[i : i + _BRIEF_BATCH_SIZE]
+            file_blocks: list[dict[str, object]] = []
+            for file in batch:
+                content = file.content[: self.config.max_content_chars]
+                analysis = analyses.get(file.path)
+                if analysis is None:
+                    continue
+                file_blocks.append(
+                    {
+                        "path": file.path,
+                        "language": file.language.value,
+                        "line_count": file.line_count,
+                        "content": content,
+                        "static_analysis": analysis.to_summary_text(),
+                        "imports_from": relationships.imports_from.get(file.path, []),
+                        "imported_by": relationships.imported_by.get(file.path, []),
+                    }
+                )
+
+            if not file_blocks:
+                continue
+
+            prompt = build_batch_brief_doc_prompt(file_blocks)
+
+            async with self._semaphore:
+                raw = await self._provider.complete(prompt)
+
+            # 3. Split combined response into per-file sections and cache each
+            file_sections = _split_batch_response(raw, [f.path for f in batch])
+            for file, section_text in zip(batch, file_sections):
+                cache_key = _file_doc_cache_key(
+                    file.sha + ":brief", self._provider.model_name
+                )
+                self._cache_set(cache_key, section_text)
+                results[file.path] = _parse_file_doc(
+                    section_text, file, self._provider.model_name, DocTier.BRIEF
+                )
+
+            if on_batch_done:
+                on_batch_done(len(batch))
+
+        return results
 
     # ── Architecture overview ─────────────────────────────────────────────────
 
@@ -332,6 +420,44 @@ class DocGenerator:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _split_batch_response(raw: str, expected_paths: list[str]) -> list[str]:
+    """Split a batch LLM response into per-file sections.
+
+    Expects the response to use ``---FILE_DOC: <path>---`` markers between
+    sections.  Falls back to splitting on repeated ``## Overview`` headings
+    when markers are absent, and finally to returning the whole response for
+    single-file batches.
+    """
+    # Primary: split on ---FILE_DOC: <path>--- markers
+    marker_re = re.compile(r"---FILE_DOC:\s*.+?\s*---")
+    splits = marker_re.split(raw)
+    sections = [s.strip() for s in splits[1:]] if len(splits) > 1 else []
+
+    if len(sections) >= len(expected_paths):
+        return sections[: len(expected_paths)]
+
+    # If the primary split found at least one section, pad with empty strings
+    if sections:
+        while len(sections) < len(expected_paths):
+            sections.append("")
+        return sections[: len(expected_paths)]
+
+    # Fallback for a single file: the whole response IS the doc
+    if len(expected_paths) == 1:
+        return [raw.strip()]
+
+    # Fallback: try splitting on repeated ## Overview headings
+    overview_sections = re.split(r"(?=^## Overview\b)", raw, flags=re.MULTILINE)
+    overview_sections = [s.strip() for s in overview_sections if s.strip()]
+    if len(overview_sections) >= len(expected_paths):
+        return overview_sections[: len(expected_paths)]
+
+    # Last resort: pad whatever we have
+    while len(overview_sections) < len(expected_paths):
+        overview_sections.append("")
+    return overview_sections[: len(expected_paths)]
+
+
 def _parse_file_doc(raw: str, file: FileNode, model: str, tier: DocTier = DocTier.FULL) -> FileDocumentation:
     """Parse the LLM's free-form markdown response into a FileDocumentation."""
     sections: dict[str, list[str]] = {}
@@ -448,11 +574,61 @@ _CONFIG_FILE_PATTERNS = (
     "vitest.setup.",
     "jest.setup.",
     "tsconfig",
+    "next.config.",
+    "nuxt.config.",
+    "angular.json",
+    ".babelrc",
+    ".prettierrc",
+    ".stylelintrc",
+    "docker-compose",
+    "dockerfile",
+    "makefile",
+    "cmakelists",
+    "cargo.toml",
+    "go.mod",
+    "go.sum",
+    "pom.xml",
+    "build.gradle",
+    "settings.gradle",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "poetry.lock",
+    "gemfile.lock",
+    "pipfile.lock",
+    "requirements.txt",
+    "setup.cfg",
+    "pyproject.toml",
+    ".editorconfig",
+    ".gitignore",
+    ".gitattributes",
+    ".npmignore",
+    ".npmrc",
+    ".nvmrc",
+    ".env.example",
+    ".env.sample",
+    "license",
+    "changelog",
+    "contributing",
+    "codeowners",
 )
+
+# Files that are entirely auto-generated or boilerplate (no LLM value)
+_SKIP_EXACT_NAMES = frozenset({
+    "__init__.py",
+    "index.js",
+    "index.ts",
+    "mod.rs",
+    "setup.py",
+})
+
+# Files under this line count are too trivial for even a BRIEF doc
+_TRIVIAL_LINE_THRESHOLD = 10
 
 
 def _is_config_file(path: str) -> bool:
-    """Return True for build-tool / test-runner config files that need no LLM."""
+    """Return True for build-tool / test-runner / lock / boilerplate files."""
     name = PurePosixPath(path).name.lower()
     return any(name.startswith(pat) or name == pat.rstrip(".") for pat in _CONFIG_FILE_PATTERNS)
 
@@ -465,10 +641,12 @@ def _classify_doc_tier(
 ) -> DocTier:
     """Decide how deeply a file should be documented.
 
-    SKIP  — no LLM call (test files, type declarations, build configs)
+    SKIP  — no LLM call (test files, type declarations, config, trivial files)
     FULL  — 10-section deep-dive (hub files, entry points, complex files)
-    BRIEF — 3-section summary (everything else)
+    BRIEF — 3-section summary (everything else worth documenting)
     """
+    name = PurePosixPath(file.path).name.lower()
+
     # ── SKIP: files where LLM adds little value ───────────────────────────
     if analysis.has_tests:
         return DocTier.SKIP
@@ -476,13 +654,19 @@ def _classify_doc_tier(
         return DocTier.SKIP
     if _is_config_file(file.path):
         return DocTier.SKIP
+    # Trivial files: too short to warrant any LLM call
+    if file.line_count < _TRIVIAL_LINE_THRESHOLD:
+        return DocTier.SKIP
+    # Barrel / re-export files that just re-export (e.g. __init__.py with no classes/functions)
+    if name in _SKIP_EXACT_NAMES and not analysis.classes and len(analysis.functions) <= 1:
+        return DocTier.SKIP
 
     # ── FULL: architecturally important or complex files ──────────────────
     if file.path in hub_set or file.path in entry_set:
         return DocTier.FULL
-    if file.line_count > 100:
+    if file.line_count > 250:
         return DocTier.FULL
-    if len(analysis.classes) >= 2 or len(analysis.functions) >= 6:
+    if len(analysis.classes) >= 2 or len(analysis.functions) >= 8:
         return DocTier.FULL
 
     # ── BRIEF: everything else (small utilities, helpers, constants) ──────

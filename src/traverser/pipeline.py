@@ -219,48 +219,49 @@ class Pipeline:
         # Separate test-tier files so we can generate one aggregate tests doc
         test_analyses = {path: a for path, a in analyses.items() if a.has_tests}
 
-        tests_overview = await self._with_spinner(
-            "Generating tests overview...",
-            self._generator.generate_tests_overview(repo_info, test_analyses),
-        ) if test_analyses else ""
+        # ── Batch 1: independent project-level docs (run in parallel) ─────
+        with console.status("  [cyan]⚡ Generating project-level docs in parallel..."):
+            batch1_tasks = [
+                self._generator.generate_architecture(
+                    repo_info, analyses, relationships, file_docs
+                ),
+                self._generator.generate_mind_map(repo_info),
+                self._generator.generate_glossary(repo_info, analyses),
+            ]
+            if test_analyses:
+                batch1_tasks.append(
+                    self._generator.generate_tests_overview(repo_info, test_analyses)
+                )
 
-        architecture = await self._with_spinner(
-            "Generating architecture overview...",
-            self._generator.generate_architecture(
-                repo_info, analyses, relationships, file_docs
-            ),
+            batch1_results = await asyncio.gather(*batch1_tasks)
+
+        architecture = batch1_results[0]
+        mind_map = batch1_results[1]
+        glossary = batch1_results[2]
+        tests_overview = batch1_results[3] if test_analyses else ""
+
+        console.print(
+            f"  [green]✓[/green] Architecture, mind map, glossary"
+            f"{', tests overview' if test_analyses else ''} generated"
         )
 
-        mind_map = await self._with_spinner(
-            "Generating mind map...",
-            self._generator.generate_mind_map(repo_info),
-        )
+        # ── Batch 2: docs that depend on architecture (run in parallel) ───
+        with console.status("  [cyan]⚡ Generating remaining docs in parallel..."):
+            batch2_results = await asyncio.gather(
+                self._generator.generate_debugging_guide(
+                    repo_info, relationships, architecture, file_docs
+                ),
+                self._generator.generate_summary(
+                    repo_info, relationships, architecture, file_docs, focus_path=focus
+                ),
+                self._generator.generate_copilot_instructions(
+                    repo_info, relationships, architecture, file_docs, focus_path=focus
+                ),
+            )
 
-        debugging_guide = await self._with_spinner(
-            "Generating debugging guide...",
-            self._generator.generate_debugging_guide(
-                repo_info, relationships, architecture, file_docs
-            ),
-        )
-
-        glossary = await self._with_spinner(
-            "Generating glossary...",
-            self._generator.generate_glossary(repo_info, analyses),
-        )
-
-        summary = await self._with_spinner(
-            "Generating SUMMARY.md...",
-            self._generator.generate_summary(
-                repo_info, relationships, architecture, file_docs, focus_path=focus
-            ),
-        )
-
-        copilot_instructions = await self._with_spinner(
-            "Generating Copilot instructions...",
-            self._generator.generate_copilot_instructions(
-                repo_info, relationships, architecture, file_docs, focus_path=focus
-            ),
-        )
+        debugging_guide = batch2_results[0]
+        summary = batch2_results[1]
+        copilot_instructions = batch2_results[2]
 
         console.print("  [green]✓[/green] All LLM artefacts generated")
 
@@ -526,12 +527,19 @@ class Pipeline:
         When *previous_shas* is provided (--update mode), files whose SHA
         matches the previous run are skipped — the LLM disk-cache will return
         the same result anyway, so this just avoids the network round-trip.
+
+        Tier routing:
+          SKIP  → excluded entirely (no doc, no output file)
+          BRIEF → batched into combined LLM calls (up to 8 per call)
+          FULL  → individual LLM calls
         """
+        from traverser.generator.doc_generator import _classify_doc_tier
+
         docs: dict[str, FileDocumentation] = {}
         analysable = {f.path: f for f in repo_info.analysable_files}
         previous_shas = previous_shas or {}
 
-        # Separate unchanged files (skip LLM call entirely) from changed/new files
+        # Separate unchanged files from changed/new files
         unchanged_paths = {
             path for path, file in analysable.items()
             if previous_shas.get(path) == file.sha
@@ -544,6 +552,35 @@ class Pipeline:
                 f"({len(files_to_process)} to regenerate)[/dim]"
             )
 
+        # ── Classify files into tiers ─────────────────────────────────────────
+        hub_set = set(relationships.hub_files)
+        entry_set = set(relationships.entry_points)
+        full_files: list[FileNode] = []
+        brief_files: list[FileNode] = []
+        skip_count = 0
+
+        for file in files_to_process:
+            analysis = analyses.get(file.path)
+            if analysis is None:
+                skip_count += 1
+                continue
+            tier = _classify_doc_tier(file, analysis, hub_set, entry_set)
+            if tier == DocTier.FULL:
+                full_files.append(file)
+            elif tier == DocTier.BRIEF:
+                brief_files.append(file)
+            else:
+                skip_count += 1
+
+        brief_batches = (len(brief_files) + 7) // 8 if brief_files else 0
+        total_docs = len(full_files) + len(brief_files)
+        console.print(
+            f"  [dim]⤷ {len(full_files)} full · {len(brief_files)} brief "
+            f"({brief_batches} batch{'es' if brief_batches != 1 else ''}) · "
+            f"{skip_count} skipped[/dim]"
+        )
+
+        # ── Generate docs ─────────────────────────────────────────────────────
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -554,44 +591,57 @@ class Pipeline:
             console=console,
         ) as progress:
             task = progress.add_task(
-                "  Generating file documentation...", total=len(files_to_process)
+                "  Generating file documentation...", total=total_docs
             )
 
-            async def _doc_one(file: FileNode) -> tuple[str, FileDocumentation]:
+            # FULL files: individual concurrent LLM calls
+            async def _doc_full(file: FileNode) -> tuple[str, FileDocumentation]:
                 doc = await self._generator.generate_file_doc(
                     file, analyses[file.path], relationships
                 )
                 progress.advance(task)
                 return file.path, doc
 
-            results = await asyncio.gather(
-                *[_doc_one(f) for f in files_to_process],
+            # BRIEF files: batched LLM calls (callback advances the bar)
+            def _on_batch_done(n: int) -> None:
+                progress.advance(task, advance=n)
+
+            # Run FULL and BRIEF concurrently
+            full_coro = asyncio.gather(
+                *[_doc_full(f) for f in full_files],
                 return_exceptions=True,
             )
+            brief_coro = self._generator.generate_brief_batch(
+                brief_files, analyses, relationships, on_batch_done=_on_batch_done,
+            )
 
-        for result in results:
+            full_results, brief_docs = await asyncio.gather(full_coro, brief_coro)
+
+        # Merge FULL results
+        for result in full_results:
             if isinstance(result, Exception):
                 logger.error("File doc generation failed: %s", result)
             else:
                 path, doc = result
                 docs[path] = doc
 
-        # For unchanged files, generate their SKIP/static-only doc (no LLM)
-        # so the output KB remains complete.  The full LLM doc is still in
-        # diskcache and will be returned on the next un-focused run.
+        # Merge BRIEF results
+        docs.update(brief_docs)
+
+        # Reload unchanged BRIEF/FULL files from cache (SKIP files excluded)
         for path in unchanged_paths:
             file = analysable[path]
-            from traverser.generator.doc_generator import _build_skip_doc, _classify_doc_tier
-            analysis = analyses[path]
-            hub_set = set(relationships.hub_files)
-            entry_set = set(relationships.entry_points)
+            analysis = analyses.get(path)
+            if analysis is None:
+                continue
             tier = _classify_doc_tier(file, analysis, hub_set, entry_set)
-            # Re-run the actual doc generation (diskcache will return instantly)
+            if tier == DocTier.SKIP:
+                continue  # Exclude static-only files from output
             try:
                 doc = await self._generator.generate_file_doc(file, analysis, relationships)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("Could not reload doc for unchanged %s: %s", path, exc)
-                doc = _build_skip_doc(file, analysis)
+                continue
             docs[path] = doc
 
         return docs

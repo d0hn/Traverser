@@ -130,6 +130,41 @@ If there are none, write “None identified.”
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BATCH BRIEF FILE DOCUMENTATION (multiple small files in one LLM call)
+# ─────────────────────────────────────────────────────────────────────────────
+
+BATCH_BRIEF_DOC_PROMPT = Template(
+    """\
+You are a concise technical documentation writer. \
+Document each of the following utility/helper files briefly and precisely.
+
+$file_blocks
+
+═══════════════════════════════════════════════════════════
+OUTPUT FORMAT
+═══════════════════════════════════════════════════════════
+For EACH file above, produce documentation using this EXACT format \
+(repeat for every file, including the separator):
+
+---FILE_DOC: <exact file path>---
+
+## Overview
+One or two sentences: what is this file's single responsibility?
+
+## Public API
+List every exported symbol (function, class, constant, type). \
+For each: one-line description and signature. Use code formatting.
+
+## Common Issues & Gotchas
+Up to three specific edge cases, pitfalls, or non-obvious behaviours. \
+If there are none, write "None identified."
+
+CRITICAL: You MUST include the ---FILE_DOC: path--- separator before \
+EACH file's documentation. Include ALL $file_count files.
+"""
+)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TESTS OVERVIEW (one aggregate doc instead of one page per test file)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -564,6 +599,34 @@ def build_brief_file_doc_prompt(
         static_analysis=static_analysis,
         imports_from=", ".join(imports_from) if imports_from else "nothing",
         imported_by=", ".join(imported_by) if imported_by else "nothing",
+    )
+
+
+def build_batch_brief_doc_prompt(
+    file_blocks_data: list[dict[str, object]],
+) -> str:
+    """Build a single prompt to document multiple BRIEF files at once.
+
+    *file_blocks_data* is a list of dicts, each with keys:
+      path, language, line_count, content, static_analysis, imports_from, imported_by
+    """
+    blocks: list[str] = []
+    for fb in file_blocks_data:
+        imports_from = ", ".join(fb["imports_from"]) if fb["imports_from"] else "nothing"  # type: ignore[arg-type]
+        imported_by = ", ".join(fb["imported_by"]) if fb["imported_by"] else "nothing"  # type: ignore[arg-type]
+        blocks.append(
+            f"═══════════════════════════════════════════════════════════\n"
+            f"FILE: {fb['path']}\n"
+            f"Language: {fb['language']} | {fb['line_count']} lines\n"
+            f"Static analysis: {fb['static_analysis']}\n"
+            f"Imports from: {imports_from}\n"
+            f"Imported by: {imported_by}\n"
+            f"═══════════════════════════════════════════════════════════\n"
+            f"```{fb['language']}\n{fb['content']}\n```"
+        )
+    return BATCH_BRIEF_DOC_PROMPT.substitute(
+        file_blocks="\n\n".join(blocks),
+        file_count=len(file_blocks_data),
     )
 
 

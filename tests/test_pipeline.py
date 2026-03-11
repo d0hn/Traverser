@@ -142,8 +142,13 @@ class TestPipelineFullRun:
             path="src/good.py",
             name="good.py",
             language=Language.PYTHON,
-            size_bytes=30,
-            content="def hello(): pass\n",
+            size_bytes=300,
+            content=(
+                "import os\nimport sys\n\nMY_CONST = 42\n\n"
+                "def hello():\n    \"\"\"Say hello.\"\"\"\n    return 'hello'\n\n"
+                "def goodbye():\n    \"\"\"Say goodbye.\"\"\"\n    return 'goodbye'\n\n"
+                "def main():\n    print(hello())\n    print(goodbye())\n"
+            ),
             sha="good",
         )
         repo = RepoInfo(

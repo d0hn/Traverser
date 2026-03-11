@@ -8,6 +8,7 @@ import json
 import logging
 import re
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -19,6 +20,9 @@ from traverser.config import Config
 from traverser.models.repo_models import FileNode, Language, RepoInfo, detect_language
 
 logger = logging.getLogger(__name__)
+
+# Maximum number of concurrent GitHub API requests when fetching file contents.
+_FETCH_WORKERS = 15
 
 # Regex to parse GitHub URLs in various forms:
 # https://github.com/owner/repo
@@ -225,13 +229,11 @@ class GithubFetcher:
         skip_dirs = self.config.skip_directories_set
         max_bytes = self.config.max_file_size_kb * 1024
 
-        files: list[FileNode] = []
-
         try:
             tree = repo.get_git_tree(repo.default_branch, recursive=True)
         except GithubException as exc:
             logger.error("Failed to get git tree: %s", exc)
-            return files
+            return []
 
         blobs: list[Any] = [item for item in tree.tree if item.type == "blob"]
         logger.info("Tree contains %d blobs", len(blobs))
@@ -260,14 +262,62 @@ class GithubFetcher:
         if on_tree is not None:
             on_tree(len(eligible))
 
-        for item in eligible:
-            file_node = self._fetch_file(repo, item.path, item.sha)
-            if file_node is not None:
-                files.append(file_node)
-            if on_file is not None:
-                on_file()
+        # Fetch file contents in parallel using the Git Blobs API.
+        # The tree already provides each blob's SHA, so we call
+        # get_git_blob(sha) directly instead of get_contents(path) — this
+        # avoids an extra path-resolution step on GitHub's side.
+        files: list[FileNode] = []
+
+        def _fetch_blob(item: Any) -> FileNode | None:
+            return self._fetch_blob(repo, item.path, item.sha)
+
+        with ThreadPoolExecutor(max_workers=_FETCH_WORKERS) as pool:
+            futures = {pool.submit(_fetch_blob, item): item for item in eligible}
+            for future in as_completed(futures):
+                result = future.result()
+                if result is not None:
+                    files.append(result)
+                if on_file is not None:
+                    on_file()
+
+        # Preserve deterministic ordering (original tree order)
+        path_order = {item.path: idx for idx, item in enumerate(eligible)}
+        files.sort(key=lambda f: path_order.get(f.path, 0))
 
         return files
+
+    def _fetch_blob(
+        self, repo: Repository, path: str, sha: str
+    ) -> FileNode | None:
+        """Fetch file content via the Git Blobs API (faster than get_contents).
+
+        Uses ``repo.get_git_blob(sha)`` which only needs the blob SHA — no
+        path resolution on the server side — and is safe for parallel calls.
+        """
+        try:
+            blob = repo.get_git_blob(sha)
+        except GithubException as exc:
+            logger.warning("Could not fetch blob %s (%s): %s", path, sha[:8], exc)
+            return None
+
+        try:
+            raw = base64.b64decode(blob.content)
+            content = raw.decode("utf-8")
+        except (UnicodeDecodeError, Exception):
+            logger.debug("Skipping (binary content): %s", path)
+            return None
+
+        name = PurePosixPath(path).name
+        language = detect_language(name)
+
+        return FileNode(
+            path=path,
+            name=name,
+            language=language,
+            size_bytes=len(content.encode("utf-8")),
+            content=content,
+            sha=sha,
+        )
 
     def _fetch_file(
         self, repo: Repository, path: str, sha: str
