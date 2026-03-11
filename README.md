@@ -101,11 +101,65 @@ traverser generate URL [OPTIONS]
 
 **LLM Providers:**
 
-| Provider | Cost | Setup | Models |
-|----------|------|-------|--------|
-| `openai` | Pay-per-token | `OPENAI_API_KEY` env var | gpt-4o, gpt-5, o3, etc. |
-| `anthropic` | Pay-per-token | `ANTHROPIC_API_KEY` env var | claude-3-5-sonnet, claude-3-opus, etc. |
-| `github-copilot` | Included with Copilot subscription | `brew install copilot-cli` | claude-sonnet-4.6, gpt-5.2, claude-opus-4.6, o3, etc. |
+| Provider | Cost | Setup | Details |
+|----------|------|-------|---------|
+| `openai` | Pay-per-token | `OPENAI_API_KEY` env var | [See supported models →](./MODELS.md#openai) |
+| `anthropic` | Pay-per-token | `ANTHROPIC_API_KEY` env var | [See supported models →](./MODELS.md#anthropic) |
+| `github-copilot` | Included with Copilot subscription | `brew install copilot-cli` | [See supported models →](./MODELS.md#github-copilot) |
+
+# Supported Models
+
+> Model availability changes frequently. Links to official docs are provided for each provider.
+
+---
+
+## OpenAI
+
+[Full list →](https://platform.openai.com/docs/models)
+
+| Model | Best for |
+|-------|----------|
+| `gpt-5.4` | Flagship reasoning, complex codebases, agentic tasks |
+| `gpt-5.2` | Strong general coding, slightly more affordable than 5.4 |
+| `gpt-5` | Previous flagship, still available |
+| `gpt-5-mini` | Fast, cost-efficient, good for smaller repos |
+| `gpt-5-nano` | Highest speed, lowest cost, bulk processing |
+| `gpt-4.1` | Balanced everyday use, 1M token context |
+| `o3` | Deep chain-of-thought reasoning |
+
+---
+
+## Anthropic
+
+[Full list →](https://docs.anthropic.com/en/docs/about-claude/models/overview)
+
+| Model | Best for |
+|-------|----------|
+| `claude-opus-4-6` | Most powerful, deep architecture analysis |
+| `claude-sonnet-4-6` | Best balance of quality and speed (recommended) |
+| `claude-opus-4-5` | Strong coding and reasoning |
+| `claude-sonnet-4-5` | Fast, reliable everyday analysis |
+| `claude-haiku-4-5` | Lightweight, high-volume, fast responses |
+
+---
+
+## GitHub Copilot
+
+[Full list →](https://docs.github.com/en/copilot/reference/ai-models/supported-models)
+
+> No API key required — uses your existing Copilot subscription.
+> Run `copilot help config` to see the live model list in your CLI.
+
+| Model | Provider | Best for |
+|-------|----------|----------|
+| `claude-sonnet-4-5` | Anthropic | Default — good all-rounder |
+| `claude-opus-4-6` | Anthropic | Deep analysis, complex repos |
+| `claude-haiku-4-5` | Anthropic | Fast, lightweight tasks |
+| `gpt-5.4` | OpenAI | Heavy agentic/coding tasks |
+| `gpt-4.1` | OpenAI | Balanced, free-tier eligible |
+| `gpt-5-mini` | OpenAI | Fast and cost-efficient |
+| `o3` | OpenAI | Chain-of-thought reasoning |
+| `gemini-2.5-pro` | Google | Long context, multimodal |
 
 ### `traverser copilot` — GitHub Copilot instructions only
 
