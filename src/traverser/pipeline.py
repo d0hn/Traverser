@@ -615,7 +615,22 @@ class Pipeline:
                 brief_files, analyses, relationships, on_batch_done=_on_batch_done,
             )
 
-            full_results, brief_docs = await asyncio.gather(full_coro, brief_coro)
+            full_results, brief_result = await asyncio.gather(
+                full_coro,
+                brief_coro,
+                return_exceptions=True,
+            )
+
+        brief_docs: dict[str, FileDocumentation]
+        if isinstance(brief_result, Exception):
+            logger.error("BRIEF batch generation failed: %s", brief_result)
+            console.print(
+                "  [yellow]⚠[/yellow] BRIEF batch generation partially failed — "
+                "recovering from cache/individual calls..."
+            )
+            brief_docs = {}
+        else:
+            brief_docs = brief_result
 
         # Merge FULL results
         for result in full_results:
@@ -627,6 +642,20 @@ class Pipeline:
 
         # Merge BRIEF results
         docs.update(brief_docs)
+
+        # Recover any missing BRIEF docs one-by-one. This is resilient after
+        # partial batch failures and also reuses cache entries produced before
+        # an interruption/crash.
+        missing_brief = [f for f in brief_files if f.path not in docs]
+        for file in missing_brief:
+            try:
+                docs[file.path] = await self._generator.generate_file_doc(
+                    file,
+                    analyses[file.path],
+                    relationships,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error("BRIEF recovery failed for %s: %s", file.path, exc)
 
         # Reload unchanged BRIEF/FULL files from cache (SKIP files excluded)
         for path in unchanged_paths:

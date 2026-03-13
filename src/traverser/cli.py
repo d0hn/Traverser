@@ -379,6 +379,43 @@ def copilot(
 # ── config command ────────────────────────────────────────────────────────────
 
 
+@app.command()
+def compact(
+    output_root: Annotated[
+        Path,
+        typer.Argument(
+            help="Existing traverser output folder, e.g. output/owner_repo"
+        ),
+    ],
+    bundle_size: Annotated[
+        int,
+        typer.Option("--bundle-size", help="How many BRIEF docs per bundle"),
+    ] = 100,
+) -> None:
+    """Bundle BRIEF docs in an already-generated output folder.
+
+    No fetch, no analysis, no LLM calls.
+    Useful when you already generated docs and need fewer files for NotebookLM.
+    """
+    from traverser.output.compactor import compact_output
+
+    try:
+        stats = compact_output(output_root, bundle_size=bundle_size)
+    except ValueError as exc:
+        err_console.print(f"[red]Error:[/red] {exc}")
+        raise typer.Exit(1) from exc
+
+    console.print("[bold green]✓ Compact complete[/bold green]")
+    console.print(
+        f"  Brief docs: [bold]{stats['brief_docs']}[/bold]\n"
+        f"  Bundles: [bold]{stats['bundles']}[/bold]\n"
+        f"  Deleted per-file BRIEF docs: [bold]{stats['deleted_files']}[/bold]"
+    )
+
+
+# ── config command ────────────────────────────────────────────────────────────
+
+
 @app.command(name="config")
 def show_config() -> None:
     """Show the resolved configuration (reads .env if present)."""

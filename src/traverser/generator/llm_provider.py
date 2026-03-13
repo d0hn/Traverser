@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import subprocess
+from pathlib import Path
 from typing import Protocol
 
 import anthropic
@@ -222,15 +224,58 @@ class GitHubCopilotProvider:
 
     @staticmethod
     def _find_copilot() -> str:
-        """Locate the `copilot` binary on $PATH."""
-        path = shutil.which("copilot")
-        if not path:
+        """Locate a working standalone `copilot` binary.
+
+        VS Code may inject an internal shim on PATH:
+        .../github.copilot-chat/copilotCli/copilot
+        That shim can return empty output in non-interactive subprocess usage.
+        Prefer the standalone CLI (Homebrew/npm install) when available.
+        """
+        override = os.getenv("COPILOT_CLI_PATH")
+        candidates: list[str] = []
+        if override:
+            candidates.append(override)
+
+        which_path = shutil.which("copilot")
+        if which_path:
+            candidates.append(which_path)
+
+        # Common standalone install locations on macOS
+        candidates.extend([
+            "/opt/homebrew/bin/copilot",
+            "/usr/local/bin/copilot",
+        ])
+
+        existing: list[str] = []
+        for c in candidates:
+            p = Path(c).expanduser()
+            if p.exists() and os.access(str(p), os.X_OK):
+                existing.append(str(p))
+
+        def is_vscode_shim(p: str) -> bool:
+            return "github.copilot-chat/copilotCli/copilot" in p.replace("\\", "/")
+
+        # Prefer non-shim candidate
+        for p in existing:
+            if not is_vscode_shim(p):
+                return p
+
+        # Fall back to shim only if that's all we have
+        if existing:
+            logger.warning(
+                "Using VS Code Copilot shim (%s). If prompt mode returns empty output, "
+                "install/use standalone Copilot CLI and set COPILOT_CLI_PATH.",
+                existing[0],
+            )
+            return existing[0]
+
+        if not which_path:
             raise ValueError(
                 "GitHub Copilot CLI not found on $PATH. "
                 "Install with: brew install copilot-cli  "
                 "(see https://github.com/github/copilot-cli)"
             )
-        return path
+        return which_path
 
     @property
     def model_name(self) -> str:
@@ -254,16 +299,23 @@ class GitHubCopilotProvider:
         if self._model:
             cmd.extend(["--model", self._model])
 
+        # Complex prompts (e.g., architecture for large repos) may need > 180s.
+        # Use 600s (10 min) timeout for better reliability on slower/overloaded systems.
+        timeout_sec = 600
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=180,
+                timeout=timeout_sec,
             )
         except subprocess.TimeoutExpired as exc:
             raise ValueError(
-                "GitHub Copilot CLI timed out after 180 s"
+                f"GitHub Copilot CLI timed out after {timeout_sec} s "
+                f"(prompt size: {len(prompt)} chars). Try: "
+                f"(1) reducing max_content_chars in config; "
+                f"(2) using --focus to restrict analysis; "
+                f"(3) checking if copilot process is hanging."
             ) from exc
         except FileNotFoundError as exc:
             raise ValueError(
@@ -286,7 +338,9 @@ class GitHubCopilotProvider:
         if not text:
             raise ValueError(
                 "GitHub Copilot CLI returned an empty response. "
-                "Check authentication: run `copilot` interactively first."
+                f"Active binary: {self._copilot_bin}. "
+                "If this is the VS Code shim, use standalone CLI (e.g. /opt/homebrew/bin/copilot) "
+                "or set COPILOT_CLI_PATH, then run `copilot` once interactively to verify auth."
             )
         return text
 

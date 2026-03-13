@@ -63,6 +63,9 @@ traverser generate https://github.com/owner/repo --update
 
 # Generate GitHub Copilot workspace instructions only
 traverser copilot https://github.com/owner/repo
+
+# Reduce output file count for LM tools (NotebookLM) (hard 300-file limit) — no LLM calls
+traverser compact output/owner_repo
 ```
 
 ---
@@ -84,9 +87,14 @@ output/owner_repo/
 │   └── copilot-instructions.md  ← GitHub Copilot workspace context (<600 words)
 ├── .traverser-state.json   ← SHA state for --update diff mode
 └── files/
-    ├── src__app__main.md   ← per-file documentation
+    ├── src__app__main.md        ← FULL-tier per-file documentation
+    ├── BRIEF_BUNDLE_01.md       ← up to 100 BRIEF docs bundled together
+    ├── BRIEF_BUNDLE_02.md       ← (created by `compact` or automatically on write)
     └── ...
 ```
+
+> **NotebookLM has a 300-source limit.** Large repos can easily exceed this with one file per source.
+> Run `traverser compact output/owner_repo` to bundle BRIEF-tier docs and stay well under the limit.
 
 Upload the entire `output/owner_repo/` folder to NotebookLM as a source collection.  
 Copy `.github/copilot-instructions.md` to your repository root to give GitHub Copilot automatic workspace context.
@@ -218,6 +226,33 @@ traverser analyse URL [OPTIONS]
   --focus/-F TEXT       Restrict analysis to a subpath prefix
 ```
 
+### `traverser compact` — reduce output file count (no LLM calls)
+
+```
+traverser compact OUTPUT_DIR [OPTIONS]
+  OUTPUT_DIR            Path to an existing traverser output folder (e.g. output/owner_repo)
+  --bundle-size INT     BRIEF docs per bundle file (default: 100)
+```
+
+Bundles all BRIEF-tier docs into a small number of combined files (`BRIEF_BUNDLE_01.md`, etc.),
+and updates `FILE_INDEX.md` links accordingly. No fetch, no analysis, no LLM calls.
+
+**When to use it:**
+- You hit NotebookLM's 300-source limit
+- You already generated docs and don't want to re-run the full pipeline
+- You want a cleaner folder with fewer files to manage
+
+New runs automatically bundle BRIEF docs during write, so `compact` is mainly useful for
+already-generated output folders.
+
+```bash
+# Bundle BRIEF docs in an existing output folder
+traverser compact output/owner_repo
+
+# Custom bundle size (50 docs per file)
+traverser compact output/owner_repo --bundle-size 50
+```
+
 ### `traverser config` — show resolved configuration
 
 ```
@@ -264,9 +299,16 @@ For richer analysis using NotebookLM:
 # Generate full knowledge base
 traverser generate https://github.com/owner/repo
 
+# NotebookLM has a hard 300-source limit — large repos easily exceed this.
+# Bundle BRIEF docs to stay well under the limit (no LLM calls):
+traverser compact output/owner_repo
+
 # Upload output/owner_repo/ folder to NotebookLM as a source collection
 # NotebookLM will use that context for all follow-up questions
 ```
+
+> **Tip:** After compacting, a repo with 500 files typically produces ~100 output files:
+> ~80 FULL docs + 5 BRIEF bundle files + ~10 top-level docs.
 
 ---
 
@@ -278,7 +320,7 @@ Traverser uses a 3-tier documentation strategy to reduce LLM costs by ~50–55%:
 |------|-------|----------|-------------|
 | **FULL** | 🟢 | Hub files, entry points, files > 100 lines, ≥2 classes or ≥6 functions | 10-section deep-dive |
 | **BRIEF** | 🟡 | Small utilities, helpers, constants | 3-section summary |
-| **SKIP** | ⚪ | Test files, `.d.ts` declarations, build config files | Static analysis only |
+| **SKIP** | ⚪ | Test files, `.d.ts` declarations, build config files | Skipped |
 
 ---
 
@@ -286,7 +328,7 @@ Traverser uses a 3-tier documentation strategy to reduce LLM costs by ~50–55%:
 
 ```
 traverser/
-├── cli.py              ← Typer CLI — 4 commands: generate, analyse, config, copilot
+├── cli.py              ← Typer CLI — 5 commands: generate, analyse, compact, config, copilot
 ├── config.py           ← Pydantic-settings configuration
 ├── pipeline.py         ← Main async orchestrator (focus filter, update/diff mode)
 ├── fetcher/
@@ -306,7 +348,8 @@ traverser/
 │   ├── repo_models.py
 │   └── doc_models.py           ← DocTier enum, KnowledgeBase with summary/copilot fields
 └── output/
-    └── writer.py               ← Markdown writer (SUMMARY.md + .github/copilot-instructions.md)
+    ├── writer.py               ← Markdown writer (SUMMARY.md + .github/copilot-instructions.md)
+    └── compactor.py            ← Post-process existing output: bundle BRIEF docs, update FILE_INDEX
 ```
 
 ---
@@ -339,5 +382,6 @@ mypy src/
 | `.github/copilot-instructions.md` | GitHub Copilot auto-loads this for workspace-level context |
 | 3-tier doc system (FULL/BRIEF/SKIP) | ~50–55% token reduction on typical repos |
 | Markdown output | Works with NotebookLM, Obsidian, GitHub, Copilot, etc. |
+| BRIEF bundling (`compact`) | Keeps output under NotebookLM's 300-file cap; runs on existing output with no LLM cost |
 | Async pipeline | Parallel LLM calls with semaphore — 5–10× faster |
 | Pluggable LLM provider | OpenAI today, Anthropic/Ollama tomorrow |
