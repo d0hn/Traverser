@@ -7,6 +7,8 @@ import pytest
 from traverser.config import Config
 from traverser.fetcher.github_fetcher import (
     GithubFetcher,
+    _clone_repo,
+    _git_available,
     _is_binary_path,
     _should_skip_path,
     parse_github_url,
@@ -159,3 +161,70 @@ class TestRepositorySnapshotCache:
             expected_head_sha="newsha",
         )
         assert loaded is None
+
+
+class TestGitAvailable:
+    def test_returns_bool(self) -> None:
+        result = _git_available()
+        assert isinstance(result, bool)
+
+    def test_git_is_available_in_test_env(self) -> None:
+        # git should be available in any standard CI / dev environment
+        assert _git_available() is True
+
+    def test_returns_false_when_git_missing(self, monkeypatch) -> None:
+        import shutil
+
+        monkeypatch.setattr(shutil, "which", lambda _name: None)
+        assert _git_available() is False
+
+
+class TestCloneRepo:
+    def test_timeout_returns_false(self, monkeypatch, tmp_path) -> None:
+        import subprocess
+
+        def _raise_timeout(*_a, **_kw):  # noqa: ANN202
+            raise subprocess.TimeoutExpired(cmd=["git"], timeout=300)
+
+        monkeypatch.setattr(subprocess, "run", _raise_timeout)
+        result = _clone_repo("https://github.com/owner/repo.git", None, tmp_path / "dest")
+        assert result is False
+
+    def test_nonzero_exit_returns_false(self, monkeypatch, tmp_path) -> None:
+        import subprocess
+
+        mock_result = subprocess.CompletedProcess(
+            args=["git"], returncode=128, stdout=b"", stderr=b"fatal: repo not found"
+        )
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_kw: mock_result)
+        result = _clone_repo("https://github.com/owner/repo.git", None, tmp_path / "dest")
+        assert result is False
+
+    def test_success_returns_true(self, monkeypatch, tmp_path) -> None:
+        import subprocess
+
+        mock_result = subprocess.CompletedProcess(
+            args=["git"], returncode=0, stdout=b"", stderr=b""
+        )
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_kw: mock_result)
+        result = _clone_repo("https://github.com/owner/repo.git", None, tmp_path / "dest")
+        assert result is True
+
+    def test_token_embedded_in_url(self, monkeypatch, tmp_path) -> None:
+        """Token must be embedded in the HTTPS URL but never logged."""
+        import subprocess
+
+        captured: list[list[str]] = []
+
+        def _capture_subprocess_call(cmd, **_kw):  # noqa: ANN202
+            captured.append(cmd)
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", _capture_subprocess_call)
+        _clone_repo("https://github.com/owner/repo.git", "mytoken", tmp_path / "dest")
+
+        assert captured, "subprocess.run was not called"
+        clone_cmd = captured[0]
+        assert any("mytoken@github.com" in part for part in clone_cmd), (
+            "Token should be embedded in the clone URL"
+        )

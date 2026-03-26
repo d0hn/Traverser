@@ -520,3 +520,125 @@ class TestPhpAnalyzer:
         assert result.error is None
         assert result.classes == []
         assert result.functions == []
+
+
+class TestRelationshipMapperImprovedResolution:
+    """Tests for enhanced relative and absolute import resolution."""
+
+    def _make_analysis(self, path: str, imports: list) -> FileAnalysis:
+        return FileAnalysis(path=path, language="typescript", imports=imports)
+
+    def _make_python_analysis(self, path: str, imports: list) -> FileAnalysis:
+        return FileAnalysis(path=path, language="python", imports=imports)
+
+    # ── JS/TS relative imports ────────────────────────────────────────────────
+
+    def test_js_relative_same_dir(self) -> None:
+        from traverser.models.doc_models import ImportInfo
+
+        analyses = {
+            "src/components/Button.tsx": self._make_analysis(
+                "src/components/Button.tsx",
+                [ImportInfo(module="./Avatar", is_relative=True)],
+            ),
+            "src/components/Avatar.tsx": self._make_analysis("src/components/Avatar.tsx", []),
+        }
+        mapper = RelationshipMapper()
+        result = mapper.build(analyses)
+        assert "src/components/Avatar.tsx" in result.imports_from["src/components/Button.tsx"]
+        assert "src/components/Button.tsx" in result.imported_by["src/components/Avatar.tsx"]
+
+    def test_js_relative_parent_dir(self) -> None:
+        from traverser.models.doc_models import ImportInfo
+
+        analyses = {
+            "src/services/userService.ts": self._make_analysis(
+                "src/services/userService.ts",
+                [ImportInfo(module="../models/User", is_relative=True)],
+            ),
+            "src/models/User.ts": self._make_analysis("src/models/User.ts", []),
+        }
+        mapper = RelationshipMapper()
+        result = mapper.build(analyses)
+        assert "src/models/User.ts" in result.imports_from["src/services/userService.ts"]
+        assert "src/services/userService.ts" in result.imported_by["src/models/User.ts"]
+
+    def test_js_relative_js_extension(self) -> None:
+        from traverser.models.doc_models import ImportInfo
+
+        analyses = {
+            "lib/helpers.js": self._make_analysis(
+                "lib/helpers.js",
+                [ImportInfo(module="./utils", is_relative=True)],
+            ),
+            "lib/utils.js": self._make_analysis("lib/utils.js", []),
+        }
+        mapper = RelationshipMapper()
+        result = mapper.build(analyses)
+        assert "lib/utils.js" in result.imports_from["lib/helpers.js"]
+
+    def test_js_relative_index_file(self) -> None:
+        from traverser.models.doc_models import ImportInfo
+
+        analyses = {
+            "src/app.ts": self._make_analysis(
+                "src/app.ts",
+                [ImportInfo(module="./components", is_relative=True)],
+            ),
+            "src/components/index.ts": self._make_analysis("src/components/index.ts", []),
+        }
+        mapper = RelationshipMapper()
+        result = mapper.build(analyses)
+        assert "src/components/index.ts" in result.imports_from["src/app.ts"]
+
+    # ── Python level-based relative imports ──────────────────────────────────
+
+    def test_python_level1_same_dir(self) -> None:
+        from traverser.models.doc_models import ImportInfo
+
+        analyses = {
+            "src/pkg/file.py": self._make_python_analysis(
+                "src/pkg/file.py",
+                [ImportInfo(module="utils", is_relative=True, level=1)],
+            ),
+            "src/pkg/utils.py": self._make_python_analysis("src/pkg/utils.py", []),
+        }
+        mapper = RelationshipMapper()
+        result = mapper.build(analyses)
+        assert "src/pkg/utils.py" in result.imports_from["src/pkg/file.py"]
+
+    def test_python_level2_parent_dir(self) -> None:
+        from traverser.models.doc_models import ImportInfo
+
+        analyses = {
+            "src/pkg/sub/file.py": self._make_python_analysis(
+                "src/pkg/sub/file.py",
+                [ImportInfo(module="config", is_relative=True, level=2)],
+            ),
+            "src/pkg/config.py": self._make_python_analysis("src/pkg/config.py", []),
+        }
+        mapper = RelationshipMapper()
+        result = mapper.build(analyses)
+        assert "src/pkg/config.py" in result.imports_from["src/pkg/sub/file.py"]
+
+    # ── Constructor / single-use file detection ───────────────────────────────
+
+    def test_constructor_file_has_imported_by(self) -> None:
+        """Regression: a constructor/class file used by another file must appear in imported_by."""
+        from traverser.models.doc_models import ImportInfo
+
+        analyses = {
+            "src/models/UserConstructor.ts": self._make_analysis(
+                "src/models/UserConstructor.ts", []
+            ),
+            "src/services/UserService.ts": self._make_analysis(
+                "src/services/UserService.ts",
+                [ImportInfo(module="../models/UserConstructor", is_relative=True)],
+            ),
+        }
+        mapper = RelationshipMapper()
+        result = mapper.build(analyses)
+        imported_by = result.imported_by.get("src/models/UserConstructor.ts", [])
+        assert "src/services/UserService.ts" in imported_by, (
+            "Constructor file must appear in imported_by when it is used by another file"
+        )

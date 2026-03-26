@@ -404,3 +404,50 @@ class TestBriefBatchGeneration:
         with DocGenerator(config) as generator:
             results = await generator.generate_brief_batch([], {}, ProjectRelationships())
             assert results == {}
+
+
+# ── Config auto-detection tests ───────────────────────────────────────────────
+
+
+class TestConfigProviderAutoDetect:
+    """Verify that Config auto-selects the provider from available API keys."""
+
+    def test_openai_key_keeps_openai_provider(self) -> None:
+        from traverser.config import Config, LLMProvider
+
+        cfg = Config(openai_api_key="sk-test")
+        assert cfg.llm_provider == LLMProvider.OPENAI
+
+    def test_anthropic_key_only_switches_provider(self) -> None:
+        from traverser.config import Config, LLMProvider
+
+        cfg = Config(openai_api_key=None, anthropic_api_key="sk-ant-test")
+        assert cfg.llm_provider == LLMProvider.ANTHROPIC
+
+    def test_anthropic_key_switches_default_model(self) -> None:
+        from traverser.config import Config, LLMProvider
+
+        cfg = Config(openai_api_key=None, anthropic_api_key="sk-ant-test")
+        assert cfg.llm_provider == LLMProvider.ANTHROPIC
+        # Model should switch away from the OpenAI default
+        assert "gpt" not in cfg.llm_model
+
+    def test_explicit_provider_not_overridden(self) -> None:
+        from traverser.config import Config, LLMProvider
+
+        # If user explicitly sets provider to anthropic, it should not be changed
+        cfg = Config(llm_provider=LLMProvider.ANTHROPIC, anthropic_api_key="sk-ant-test")
+        assert cfg.llm_provider == LLMProvider.ANTHROPIC
+
+    def test_no_keys_keeps_openai_default(self) -> None:
+        from traverser.config import Config, LLMProvider
+
+        cfg = Config(openai_api_key=None, anthropic_api_key=None)
+        # Falls through without raising; require_api_key() will error later
+        assert cfg.llm_provider == LLMProvider.OPENAI
+
+    def test_github_copilot_provider_unchanged(self) -> None:
+        from traverser.config import Config, LLMProvider
+
+        cfg = Config(llm_provider=LLMProvider.GITHUB_COPILOT)
+        assert cfg.llm_provider == LLMProvider.GITHUB_COPILOT

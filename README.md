@@ -36,8 +36,8 @@ uv pip install -e ".[dev]"
 
 # 2. Configure
 cp .env.example .env
-# edit .env — set LLM_PROVIDER (github-copilot needs no API key;
-#              openai/anthropic need OPENAI_API_KEY or ANTHROPIC_API_KEY)
+# edit .env — set OPENAI_API_KEY, ANTHROPIC_API_KEY, or use --provider github-copilot
+# Traverser auto-detects the provider from whichever key is present; no LLM_PROVIDER needed
 
 # 3. Run
 traverser generate https://github.com/owner/repo
@@ -61,8 +61,8 @@ traverser generate https://github.com/owner/repo --focus src/services
 # Re-process only files changed since the last run (fast incremental update)
 traverser generate https://github.com/owner/repo --update
 
-# Generate GitHub Copilot workspace instructions only
-traverser copilot https://github.com/owner/repo
+# Generate GitHub Copilot workspace instructions only (minimal cost)
+traverser generate https://github.com/owner/repo --copilot-only
 
 # Reduce output file count for LM tools (NotebookLM) (hard 300-file limit) — no LLM calls
 traverser compact output/owner_repo
@@ -116,7 +116,12 @@ traverser generate URL [OPTIONS]
   --dry-run             Fetch and analyse only — no LLM calls, no output files
   --focus/-F TEXT       Restrict analysis to a subpath prefix (e.g. src/services)
   --update/-u           Re-process only files whose SHA changed since last run
+  --copilot-only        Generate only SUMMARY.md + .github/copilot-instructions.md (minimal cost)
 ```
+
+> **Provider auto-detection:** If `LLM_PROVIDER` is not set in `.env`, Traverser
+> automatically picks the provider whose API key is present. Set only
+> `ANTHROPIC_API_KEY` and it will use Anthropic without any extra configuration.
 
 **LLM Providers:**
 
@@ -180,17 +185,15 @@ traverser generate URL [OPTIONS]
 | `o3` | OpenAI | Chain-of-thought reasoning |
 | `gemini-2.5-pro` | Google | Long context, multimodal |
 
-### `traverser copilot` — GitHub Copilot instructions only
+### `traverser copilot` — **deprecated**, use `generate --copilot-only`
 
 ```
-traverser copilot URL [OPTIONS]
-  URL                   GitHub repository URL
-  --token/-t TEXT       GitHub PAT
-  --output-dir/-o PATH  Where to write output (default: ./output)
-  --provider TEXT       LLM provider: openai | anthropic | github-copilot
-  --model/-m TEXT       LLM model name
-  --focus/-F TEXT       Restrict analysis to a subpath prefix
+traverser copilot URL [OPTIONS]   ← deprecated alias
 ```
+
+> ⚠️ **Deprecated.** Use `traverser generate URL --copilot-only` instead — it has
+> the same effect and keeps everything under one command. The `copilot` sub-command
+> is preserved for backward compatibility but will print a deprecation notice.
 
 Generates `SUMMARY.md` and `.github/copilot-instructions.md`. Copy the instructions file to your repo root — GitHub Copilot picks it up automatically on every conversation in that workspace.
 
@@ -328,25 +331,25 @@ Traverser uses a 3-tier documentation strategy to reduce LLM costs by ~50–55%:
 
 ```
 traverser/
-├── cli.py              ← Typer CLI — 5 commands: generate, analyse, compact, config, copilot
-├── config.py           ← Pydantic-settings configuration
+├── cli.py              ← Typer CLI — generate (with --copilot-only), analyse, compact, config, copilot (deprecated)
+├── config.py           ← Pydantic-settings configuration + auto provider detection
 ├── pipeline.py         ← Main async orchestrator (focus filter, update/diff mode)
 ├── fetcher/
-│   └── github_fetcher.py   ← GitHub API + snapshot cache (SHA-gated)
+│   └── github_fetcher.py   ← git clone --depth=1 (primary) + GitHub API fallback + snapshot cache
 ├── analyzer/
 │   ├── base_analyzer.py
 │   ├── python_analyzer.py      ← AST-based analysis
 │   ├── javascript_analyzer.py  ← Regex-based JS/TS/Vue/React/NestJS
 │   ├── php_analyzer.py         ← Regex-based PHP/Laravel
 │   ├── generic_analyzer.py
-│   └── relationship_mapper.py
+│   └── relationship_mapper.py  ← Accurate JS/TS + Python relative import resolution
 ├── generator/
 │   ├── llm_provider.py         ← OpenAI / Anthropic abstraction
 │   ├── prompts.py              ← 9 prompt templates (incl. SUMMARY + COPILOT)
 │   └── doc_generator.py        ← Cached LLM generation + doc tier logic
 ├── models/
 │   ├── repo_models.py
-│   └── doc_models.py           ← DocTier enum, KnowledgeBase with summary/copilot fields
+│   └── doc_models.py           ← DocTier enum, ImportInfo (with level), KnowledgeBase
 └── output/
     ├── writer.py               ← Markdown writer (SUMMARY.md + .github/copilot-instructions.md)
     └── compactor.py            ← Post-process existing output: bundle BRIEF docs, update FILE_INDEX
@@ -385,3 +388,6 @@ mypy src/
 | BRIEF bundling (`compact`) | Keeps output under NotebookLM's 300-file cap; runs on existing output with no LLM cost |
 | Async pipeline | Parallel LLM calls with semaphore — 5–10× faster |
 | Pluggable LLM provider | OpenAI today, Anthropic/Ollama tomorrow |
+| Auto provider detection | Reads which API key is set; no `LLM_PROVIDER` needed for most setups |
+| `git clone --depth=1` fetch | Downloads entire repo in one network request; 10–100× faster than per-blob API calls |
+| Level-aware relative import resolution | Correctly resolves `./foo`, `../models/Bar`, and Python `from ..pkg import X` to actual files; eliminates false "not used" reports |

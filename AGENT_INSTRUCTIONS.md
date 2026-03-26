@@ -54,8 +54,8 @@ The output must therefore be:
 | Component | File(s) | Status |
 |-----------|---------|--------|
 | Data models | `models/repo_models.py`, `models/doc_models.py` | Complete |
-| Config / env loading | `config.py` | Complete |
-| GitHub fetcher | `fetcher/github_fetcher.py` | Complete |
+| Config / env loading + auto provider detection | `config.py` | Complete |
+| GitHub fetcher (git clone + API fallback) | `fetcher/github_fetcher.py` | Complete |
 | Python AST analyzer | `analyzer/python_analyzer.py` | Complete |
 | JavaScript/TypeScript analyzer | `analyzer/javascript_analyzer.py` | Complete |
 | PHP Laravel analyzer | `analyzer/php_analyzer.py` | Complete |
@@ -67,9 +67,9 @@ The output must therefore be:
 | 3-tier doc system (FULL/BRIEF/SKIP) | `generator/doc_generator.py` | Complete |
 | Output writer (9 Markdown docs + copilot) | `output/writer.py` | Complete |
 | Pipeline orchestrator | `pipeline.py` | Complete |
-| CLI (generate / analyse / config / copilot) | `cli.py` | Complete |
+| CLI (generate --copilot-only / analyse / config / copilot[deprecated]) | `cli.py` | Complete |
 | Repository snapshot cache | `fetcher/github_fetcher.py` | Complete |
-| Test suite | `tests/` | 115 tests, 78% coverage |
+| Test suite | `tests/` | 131 tests, 57% coverage |
 
 ### ❌ Not yet implemented (see Roadmap §12)
 
@@ -94,14 +94,16 @@ traverser generate <URL>
    ┌────┴──────────────────────────────────────────────────────────────┐
    │  Step 1: fetcher.GithubFetcher.fetch()                           │
    │    • Authenticates with PyGithub                                 │
-   │    • Walks git tree (recursive), filters skipped dirs + binaries │
-  │    • Emits progress callbacks: on_tree(total), on_file()         │
+   │    • Primary: git clone --depth=1 (entire repo in one request)   │
+   │    • Fallback: GitHub Blobs API (parallel, if git unavailable)   │
+   │    • Filters skipped dirs + binaries; emits on_tree/on_file      │
    │    • Returns RepoInfo with list[FileNode]                        │
    └────┬──────────────────────────────────────────────────────────────┘
         │
    ┌────┴──────────────────────────────────────────────────────────────┐
    │  Step 2: analyzer.get_analyzer(file).analyze(file)  [per file]  │
    │    • PythonAnalyzer   → ast.parse() → classes, functions, imports│
+   │      (ImportInfo now carries `level` for relative import depth)  │
    │    • JavascriptAnalyzer → regex     → same shape                 │
    │    • GenericAnalyzer  → regex       → same shape                 │
    │    → dict[path, FileAnalysis]                                    │
@@ -109,7 +111,9 @@ traverser generate <URL>
         │
    ┌────┴──────────────────────────────────────────────────────────────┐
    │  Step 3: analyzer.RelationshipMapper.build(analyses)             │
-   │    • Resolves imports → file paths using module-to-path heuristic│
+   │    • Resolves imports → file paths:                              │
+   │      – JS/TS: handles ./foo, ../models/Bar + index files         │
+   │      – Python: level-aware (from ..pkg import X → parent dir)   │
    │    • Builds NetworkX DiGraph                                     │
    │    • Identifies hub files, entry points, circular deps           │
    │    → ProjectRelationships                                        │
@@ -428,6 +432,9 @@ Always attempt to extract, in this order. Stop if a category is too hard to
 reliably extract with your approach — an empty list is better than wrong data.
 
 1. **Imports** — module name + symbols. Mark `is_relative=True` for relative imports.
+   For Python, also set `level` (the number of leading dots: `from .sibling` → `level=1`,
+   `from ..pkg` → `level=2`). For JS/TS, store the full path string in `module`
+   (e.g. `"./Avatar"`, `"../models/User"`) — the relationship mapper resolves it.
 2. **Class definitions** — name + parent class names.
 3. **Function/method definitions** — name + async flag. Parameters optional.
 4. **Constants** — language-idiomatic uppercase names.
@@ -612,14 +619,18 @@ explicit documentation. Use `pytest-mock`'s `mocker.AsyncMock` for async mocks.
 5. Update `require_api_key()` and `active_api_key` in `Config` to handle
    the new provider.
 
-6. Update `build_provider()` in `llm_provider.py` to return the new class.
+6. Update `_auto_detect_provider()` in `Config` to include the new provider
+   in the auto-detection priority order (only applies to key-based providers;
+   skip for token-based auth like `github-copilot`).
 
-7. Update `show_config()` in `cli.py` to display the new key.
+7. Update `build_provider()` in `llm_provider.py` to return the new class.
 
-8. Add `[provider]_api_key=` to `.env.example`.
+8. Update `show_config()` in `cli.py` to display the new key.
 
-9. Write a unit test in `test_generator.py` that mocks the new provider's
-   HTTP client and verifies `complete()` returns the expected string.
+9. Add `[provider]_api_key=` to `.env.example`.
+
+10. Write a unit test in `test_generator.py` that mocks the new provider's
+    HTTP client and verifies `complete()` returns the expected string.
 
 ---
 
@@ -748,6 +759,26 @@ the user specifies otherwise.
 - [x] **`--focus` flag**: Filters the fetched file list to a subpath prefix
   before analysis. Works on both `generate` and `analyse` commands.
 
+- [x] **Auto provider detection**: `Config._auto_detect_provider()` selects the
+  LLM provider from whichever API key is present in `.env`. No `LLM_PROVIDER`
+  variable required for standard single-provider setups.
+
+- [x] **`generate --copilot-only`**: Merged the `copilot` sub-command into
+  `traverser generate --copilot-only`. The standalone `copilot` command remains
+  as a deprecated alias that delegates to `generate --copilot-only`.
+
+- [x] **`git clone --depth=1` fetch strategy**: `GithubFetcher` now clones the
+  entire repository in a single network request as the primary strategy. Falls
+  back to the GitHub Blobs API when `git` is unavailable. This eliminates
+  connection-pool exhaustion and makes fetching 10–100× faster on large repos.
+
+- [x] **Accurate JS/TS + Python relative import resolution**: Rewrote
+  `_resolve_relative_import` and `_module_to_paths` in `relationship_mapper.py`.
+  JS/TS path-style imports (`./Avatar`, `../models/User`) are now resolved to
+  actual files. Python level-based imports (`from ..pkg import X`) correctly walk
+  up the directory tree. `ImportInfo` gained a `level` field (populated by
+  `PythonAnalyzer`) to support this.
+
 - [ ] **Go dedicated analyzer**: Use the `ast` equivalent for Go (parse
   `package`, `import`, `type ... struct`, `func`). Go is widely used and the
   generic regex misses receiver functions.
@@ -810,12 +841,13 @@ the user specifies otherwise.
 |-----------|--------|-----------|
 | Python 2 syntax causes AST parse errors | `error` field set; file skipped in analysis but still LLM-documented using raw content | None needed — gracefully degraded |
 | JS/TS regex misses destructuring imports | Some symbols not captured in `ImportInfo.symbols` | LLM still sees raw content; relationship resolution unaffected |
-| Relationship resolution is heuristic only | Some import→file mappings not resolved (especially dynamic imports, re-exports) | LLM sees relationship context anyway; graph is conservative |
+| Relationship resolution is heuristic only | Dynamic imports, re-exports, barrel files, and path aliases (e.g. `@/utils`) are not resolved | LLM sees relationship context anyway; graph is conservative. Path aliases require tsconfig/webpack config parsing to resolve |
 | Files > `max_content_chars` are truncated | End of large files not analysed by LLM | Increase `MAX_CONTENT_CHARS` env var; or split the file |
 | Binary files silently skipped | Documented in README | By design |
 | `diskcache` on NFS/network shares | SQLite may lock | Use `CACHE_DIR` pointing to local disk |
 | No support for GitLab, Bitbucket | Only GitHub URLs parsed | Extend `parse_github_url()` and add provider-specific fetcher |
 | Circular dependency detection limited to chains ≤ 5 | Long chains not reported | Change `len(cycle) <= 5` guard in `relationship_mapper.py` |
+| `git clone` fallback to API on restricted networks | Slightly slower; connection pool may limit parallelism | Ensure `git` is on PATH and network allows outbound git (port 443 HTTPS) |
 
 ---
 

@@ -76,6 +76,7 @@ class _PythonVisitor(ast.NodeVisitor):
                 module=module,
                 symbols=symbols,
                 is_relative=(node.level or 0) > 0,
+                level=node.level or 0,
                 alias=None,
             )
         )
