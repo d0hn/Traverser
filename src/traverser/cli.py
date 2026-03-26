@@ -82,14 +82,26 @@ def generate(
         bool,
         typer.Option("--update", "-u", help="Re-process only files whose SHA changed since the last run"),
     ] = False,
+    copilot_only: Annotated[
+        bool,
+        typer.Option(
+            "--copilot-only",
+            help="Generate only .github/copilot-instructions.md and SUMMARY.md (minimal cost). "
+            "Skips expensive per-file documentation.",
+        ),
+    ] = False,
 ) -> None:
     """
     Generate a complete NotebookLM-ready knowledge base for a GitHub repository.
+
+    Use [cyan]--copilot-only[/cyan] to generate only the Copilot instructions and summary
+    at a fraction of the cost — ideal for quickly wiring up GitHub Copilot workspace context.
 
     Example:
         traverser generate https://github.com/owner/repo --token ghp_xxx
         traverser generate https://github.com/owner/repo --focus src/services
         traverser generate https://github.com/owner/repo --update
+        traverser generate https://github.com/owner/repo --copilot-only
     """
     from traverser.config import Config, LLMProvider
     from traverser.pipeline import Pipeline
@@ -116,13 +128,30 @@ def generate(
     pipeline = Pipeline(config)
 
     try:
-        kb = asyncio.run(pipeline.run(url, token=token, dry_run=dry_run, focus=focus, update_mode=update))
+        if copilot_only:
+            kb = asyncio.run(pipeline.generate_copilot_only(url, token=token, focus=focus))
+        else:
+            kb = asyncio.run(
+                pipeline.run(url, token=token, dry_run=dry_run, focus=focus, update_mode=update)
+            )
     except ValueError as exc:
         err_console.print(f"[red]Error:[/red] {exc}")
         raise typer.Exit(1) from exc
     except KeyboardInterrupt:
         err_console.print("\n[yellow]Interrupted by user.[/yellow]")
         raise typer.Exit(130) from None
+
+    output_root = config.output_dir / f"{kb.owner}_{kb.repo_name}"
+
+    if copilot_only:
+        copilot_path = output_root / ".github" / "copilot-instructions.md"
+        console.print("\n[bold green]✓ Done![/bold green]")
+        console.print(
+            f"\n[dim]Copy this command to add Copilot instructions to your repo:[/dim]\n"
+            f"  [cyan]cp {copilot_path.resolve()} .github/copilot-instructions.md[/cyan]\n"
+            f"\n[dim]Then commit and push — GitHub Copilot will pick it up automatically.[/dim]"
+        )
+        return
 
     stats = kb.stats
     console.print("\n[bold green]✓ Done![/bold green]")
@@ -135,7 +164,6 @@ def generate(
     console.print(table)
 
     if not dry_run:
-        output_root = config.output_dir / f"{kb.owner}_{kb.repo_name}"
         console.print(
             f"\n[dim]Output:[/dim] [bold]{output_root.resolve()}[/bold]\n"
             f"[dim]Upload all files in that folder to NotebookLM.[/dim]\n"
@@ -323,56 +351,28 @@ def copilot(
     ] = None,
 ) -> None:
     """
+    [yellow]Deprecated:[/yellow] use [cyan]traverser generate --copilot-only[/cyan] instead.
+
     Generate ONLY .github/copilot-instructions.md and SUMMARY.md (minimal cost).
-
-    This is a lightweight alternative to `generate` — skips expensive per-file
-    documentation. Ideal for GitHub Copilot workspace context without burning money
-    on per-file LLM documentation.
-
-    The generated `.github/copilot-instructions.md` can be copied to your repo root.
-    GitHub Copilot will automatically load it in all conversations in that workspace.
-
-    Example:
-        traverser copilot https://github.com/owner/repo --token ghp_xxx
-        # Copy to repo:
-        cp output/owner_repo/.github/copilot-instructions.md .github/copilot-instructions.md
     """
-    from traverser.config import Config, LLMProvider
-    from traverser.pipeline import Pipeline
-
-    config = Config()
-    if output_dir:
-        config = config.model_copy(update={"output_dir": output_dir})
-    if provider:
-        config = config.model_copy(update={"llm_provider": LLMProvider(provider)})
-    if model:
-        config = config.model_copy(update={"llm_model": model})
-
-    try:
-        config.require_api_key()
-    except ValueError as exc:
-        err_console.print(f"[red]Error:[/red] {exc}")
-        raise typer.Exit(1) from exc
-
-    pipeline = Pipeline(config)
-
-    try:
-        kb = asyncio.run(pipeline.generate_copilot_only(url, token=token, focus=focus))
-    except ValueError as exc:
-        err_console.print(f"[red]Error:[/red] {exc}")
-        raise typer.Exit(1) from exc
-    except KeyboardInterrupt:
-        err_console.print("\n[yellow]Interrupted by user.[/yellow]")
-        raise typer.Exit(130) from None
-
-    output_root = config.output_dir / f"{kb.owner}_{kb.repo_name}"
-    copilot_path = output_root / ".github" / "copilot-instructions.md"
-
-    console.print("\n[bold green]✓ Done![/bold green]")
     console.print(
-        f"\n[dim]Copy this command to add Copilot instructions to your repo:[/dim]\n"
-        f"  [cyan]cp {copilot_path.resolve()} .github/copilot-instructions.md[/cyan]\n"
-        f"\n[dim]Then commit and push — GitHub Copilot will pick it up automatically.[/dim]"
+        "[yellow]⚠  'traverser copilot' is deprecated.[/yellow] "
+        "Use [cyan]traverser generate --copilot-only[/cyan] instead.\n"
+    )
+    # Delegate to generate with --copilot-only
+    ctx = typer.get_current_context()
+    ctx.invoke(
+        generate,
+        url=url,
+        token=token,
+        output_dir=output_dir,
+        provider=provider,
+        model=model,
+        no_cache=False,
+        dry_run=False,
+        focus=focus,
+        update=False,
+        copilot_only=True,
     )
 
 

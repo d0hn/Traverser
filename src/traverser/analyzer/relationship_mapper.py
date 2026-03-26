@@ -7,35 +7,98 @@ from pathlib import PurePosixPath
 
 import networkx as nx
 
-from traverser.models.doc_models import FileAnalysis, ProjectRelationships
+from traverser.models.doc_models import FileAnalysis, ImportInfo, ProjectRelationships
 
 logger = logging.getLogger(__name__)
 
+# JS/TS/Vue extensions tried when resolving a bare relative path (no extension).
+_JS_EXTENSIONS = (".ts", ".tsx", ".js", ".jsx", ".vue", ".mjs", ".cjs")
 
-def _resolve_relative_import(importer_path: str, module: str) -> str | None:
-    """Try to resolve a relative Python import to a repo-relative path.
 
-    Returns a candidate path like 'src/package/module.py' or None if
-    resolution is not possible.
+def _normalize_posix(path: str) -> str:
+    """Normalize a POSIX path string, collapsing ``..`` and ``.`` components.
+
+    Works on relative paths (no leading ``/``).
     """
-    # e.g. importer = src/pkg/subpkg/file.py, module = .sibling
-    #  → src/pkg/subpkg/sibling.py
+    parts: list[str] = []
+    for segment in path.split("/"):
+        if segment == "..":
+            if parts:
+                parts.pop()
+        elif segment and segment != ".":
+            parts.append(segment)
+    return "/".join(parts)
+
+
+def _resolve_relative_import(importer_path: str, imp: ImportInfo) -> list[str]:
+    """Resolve a relative import to a list of candidate repo-relative paths.
+
+    Handles two distinct styles:
+
+    **Python style** (``from .sibling import X``, ``from ..parent import Y``):
+        The AST parser strips leading dots and stores the level separately.
+        ``imp.module`` is the plain module name (e.g. ``"sibling"``), and
+        ``imp.level`` is the number of dots (1 = same package, 2 = parent, …).
+
+    **JavaScript / TypeScript style** (``import x from './path'``):
+        The full path is stored verbatim in ``imp.module`` (e.g.
+        ``"../models/User"``).  We resolve it relative to the importer's
+        directory and try multiple extensions.
+    """
+    module = imp.module
     importer_dir = str(PurePosixPath(importer_path).parent)
-    # module starts with '.' or is dotted (e.g. 'models.user')
-    parts = module.lstrip(".").replace(".", "/")
-    if not parts:
-        return None
-    candidate = f"{importer_dir}/{parts}.py"
-    return candidate
+
+    # ── JavaScript / TypeScript / CSS path-style relative imports ────────────
+    if module.startswith("./") or module.startswith("../"):
+        # Strip query strings / hash fragments (e.g. "./foo?raw", "#hash")
+        clean = module.split("?")[0].split("#")[0]
+        raw_resolved = _normalize_posix(f"{importer_dir}/{clean}")
+
+        candidates: list[str] = []
+        # If the import already has a recognised extension, try it first.
+        suffix = PurePosixPath(raw_resolved).suffix.lower()
+        if suffix in frozenset(_JS_EXTENSIONS) | {".py", ".css", ".scss", ".sass", ".less"}:
+            candidates.append(raw_resolved)
+        else:
+            # Bare path: try each JS/TS extension and index files.
+            for ext in _JS_EXTENSIONS:
+                candidates.append(f"{raw_resolved}{ext}")
+            for ext in _JS_EXTENSIONS:
+                candidates.append(f"{raw_resolved}/index{ext}")
+
+        return candidates
+
+    # ── Python relative import (level-based) ────────────────────────────────
+    # Navigate *up* (level - 1) directories from the importer's package dir.
+    # level=1 → same package directory; level=2 → parent package, etc.
+    level = max(imp.level, 1)  # is_relative=True guarantees level >= 1
+    base_parts = importer_dir.split("/") if importer_dir else []
+    # Remove (level - 1) trailing parts to walk up the package hierarchy.
+    steps_up = level - 1
+    if steps_up > 0:
+        base_parts = base_parts[: max(0, len(base_parts) - steps_up)]
+    base_dir = "/".join(base_parts)
+
+    if not module:
+        # e.g. ``from . import sibling`` — no module name
+        return []
+
+    parts = module.replace(".", "/")
+    prefix = f"{base_dir}/" if base_dir else ""
+    return [f"{prefix}{parts}.py"]
 
 
 def _module_to_paths(module: str, all_paths: set[str]) -> list[str]:
     """Map an absolute module name to candidate repo file paths.
 
-    For a module like 'traverser.models.user', try:
-      - traverser/models/user.py
-      - src/traverser/models/user.py
-      - traverser/models/user/__init__.py
+    For a module like ``traverser.models.user``, try:
+      - ``traverser/models/user.py``
+      - ``src/traverser/models/user.py``
+      - ``traverser/models/user/__init__.py``
+      - ``src/traverser/models/user/__init__.py``
+
+    Also handles JS/TS bare module specifiers that look like relative paths
+    without a leading ``./`` (unusual but sometimes used with path aliases).
     """
     rel = module.replace(".", "/")
     candidates = [
@@ -44,6 +107,10 @@ def _module_to_paths(module: str, all_paths: set[str]) -> list[str]:
         f"{rel}/__init__.py",
         f"src/{rel}/__init__.py",
     ]
+    # Try JS/TS extensions for absolute bare specifiers (e.g. path aliases).
+    for ext in _JS_EXTENSIONS:
+        candidates.append(f"{rel}{ext}")
+        candidates.append(f"src/{rel}{ext}")
     return [c for c in candidates if c in all_paths]
 
 
@@ -75,9 +142,8 @@ class RelationshipMapper:
                 resolved: list[str] = []
 
                 if imp.is_relative:
-                    candidate = _resolve_relative_import(path, imp.module)
-                    if candidate and candidate in all_paths:
-                        resolved = [candidate]
+                    candidates = _resolve_relative_import(path, imp)
+                    resolved = [c for c in candidates if c in all_paths]
                 else:
                     resolved = _module_to_paths(imp.module, all_paths)
 

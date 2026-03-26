@@ -7,6 +7,9 @@ import hashlib
 import json
 import logging
 import re
+import shutil
+import subprocess
+import tempfile
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
@@ -17,11 +20,12 @@ from github.ContentFile import ContentFile
 from github.Repository import Repository
 
 from traverser.config import Config
-from traverser.models.repo_models import FileNode, Language, RepoInfo, detect_language
+from traverser.models.repo_models import FileNode, RepoInfo, detect_language
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of concurrent GitHub API requests when fetching file contents.
+# Maximum number of concurrent GitHub API requests when fetching file contents
+# (used as fallback when git-clone is unavailable).
 _FETCH_WORKERS = 15
 
 # Regex to parse GitHub URLs in various forms:
@@ -67,6 +71,45 @@ def _decode_content(content_file: ContentFile) -> str | None:
         return raw.decode("utf-8")
     except (UnicodeDecodeError, Exception):
         return None  # Binary or undecodable file
+
+
+def _git_available() -> bool:
+    """Return True if the ``git`` executable is on PATH."""
+    return shutil.which("git") is not None
+
+
+def _clone_repo(clone_url: str, token: str | None, dest: Path) -> bool:
+    """Shallow-clone a repository into *dest* using ``git clone --depth=1``.
+
+    For authenticated access the token is embedded in the HTTPS URL so no
+    credential helper configuration is required.  The URL is **never logged**
+    to avoid leaking the token.
+
+    Returns True on success, False on any error (timeout, auth failure, etc.).
+    """
+    auth_url = clone_url.replace("https://", f"https://{token}@", 1) if token else clone_url
+
+    try:
+        result = subprocess.run(
+            ["git", "clone", "--depth=1", "--single-branch", auth_url, str(dest)],
+            capture_output=True,
+            timeout=300,  # 5 minutes
+        )
+        if result.returncode != 0:
+            # Log stderr without the URL (may contain token).
+            logger.warning(
+                "git clone failed (exit %d): %s",
+                result.returncode,
+                result.stderr.decode(errors="replace")[:500],
+            )
+            return False
+        return True
+    except subprocess.TimeoutExpired:
+        logger.warning("git clone timed out after 300 s")
+        return False
+    except FileNotFoundError:
+        logger.warning("git executable not found")
+        return False
 
 
 class GithubFetcher:
@@ -138,7 +181,7 @@ class GithubFetcher:
                     }
                 )
 
-        files = self._walk_tree(repo, on_tree=on_tree, on_file=on_file)
+        files = self._walk_tree(repo, token=effective_token, on_tree=on_tree, on_file=on_file)
 
         repo_info = RepoInfo(
             owner=owner,
@@ -221,10 +264,141 @@ class GithubFetcher:
     def _walk_tree(
         self,
         repo: Repository,
+        token: str | None = None,
         on_tree: Callable[[int], None] | None = None,
         on_file: Callable[[], None] | None = None,
     ) -> list[FileNode]:
-        """Walk the repository tree recursively and collect all relevant files."""
+        """Walk the repository tree and collect all relevant files.
+
+        Strategy (fastest first):
+        1. ``git clone --depth=1`` — downloads the entire working tree in one
+           network round-trip, then reads files directly from disk.  This is
+           dramatically faster than fetching each blob individually and does not
+           exhaust the GitHub API connection pool.
+        2. Parallel Git Blobs API — fallback when ``git`` is unavailable or the
+           clone fails (e.g., in network-restricted environments).
+        """
+        if _git_available():
+            files = self._walk_tree_via_clone(repo, token=token, on_tree=on_tree, on_file=on_file)
+            if files is not None:
+                return files
+            logger.info("git clone failed; falling back to GitHub Blobs API")
+
+        return self._walk_tree_via_api(repo, on_tree=on_tree, on_file=on_file)
+
+    # ── Clone-based strategy ──────────────────────────────────────────────────
+
+    def _walk_tree_via_clone(
+        self,
+        repo: Repository,
+        token: str | None = None,
+        on_tree: Callable[[int], None] | None = None,
+        on_file: Callable[[], None] | None = None,
+    ) -> list[FileNode] | None:
+        """Shallow-clone the repository and read files from disk.
+
+        Returns a list of FileNodes on success, or None if the clone failed.
+        The caller is responsible for falling back to the API strategy.
+        """
+        binary_exts = self.config.binary_extensions_set
+        skip_dirs = self.config.skip_directories_set
+        max_bytes = self.config.max_file_size_kb * 1024
+
+        with tempfile.TemporaryDirectory(prefix="traverser_clone_") as tmp_str:
+            clone_dest = Path(tmp_str) / "repo"
+            clone_url = repo.clone_url  # always HTTPS
+
+            logger.info("Cloning %s via git clone --depth=1", repo.full_name)
+            if not _clone_repo(clone_url, token, clone_dest):
+                return None
+
+            # Build a sha-map from the git tree (1 API call) so we can key
+            # our cache entries by blob SHA exactly as the API strategy does.
+            sha_map: dict[str, str] = {}
+            try:
+                tree = repo.get_git_tree(repo.default_branch, recursive=True)
+                for item in tree.tree:
+                    if item.type == "blob":
+                        sha_map[item.path] = item.sha
+            except GithubException as exc:
+                logger.warning("Could not fetch git tree for SHA map: %s", exc)
+                # Continue without SHAs — use content hash as fallback.
+
+            # Walk the cloned directory tree.
+            eligible: list[Path] = []
+            for abs_path in clone_dest.rglob("*"):
+                if not abs_path.is_file():
+                    continue
+                rel_path = abs_path.relative_to(clone_dest).as_posix()
+                if _should_skip_path(rel_path, skip_dirs):
+                    logger.debug("Skipping (directory filter): %s", rel_path)
+                    continue
+                if _is_binary_path(rel_path, binary_exts):
+                    logger.debug("Skipping (binary extension): %s", rel_path)
+                    continue
+                if abs_path.stat().st_size > max_bytes:
+                    logger.debug(
+                        "Skipping (too large: %d KB > %d KB): %s",
+                        abs_path.stat().st_size // 1024,
+                        self.config.max_file_size_kb,
+                        rel_path,
+                    )
+                    continue
+                eligible.append(abs_path)
+
+            if on_tree is not None:
+                on_tree(len(eligible))
+
+            files: list[FileNode] = []
+            for abs_path in eligible:
+                rel_path = abs_path.relative_to(clone_dest).as_posix()
+                try:
+                    content = abs_path.read_text(encoding="utf-8", errors="replace")
+                except Exception as exc:
+                    logger.debug("Skipping (read error): %s — %s", rel_path, exc)
+                    if on_file is not None:
+                        on_file()
+                    continue
+
+                # Use blob SHA from tree if available, fall back to content hash.
+                sha = sha_map.get(rel_path) or hashlib.sha256(
+                    content.encode("utf-8")
+                ).hexdigest()
+
+                name = PurePosixPath(rel_path).name
+                language = detect_language(name)
+                files.append(
+                    FileNode(
+                        path=rel_path,
+                        name=name,
+                        language=language,
+                        size_bytes=len(content.encode("utf-8")),
+                        content=content,
+                        sha=sha,
+                    )
+                )
+                if on_file is not None:
+                    on_file()
+
+        # Sort to match the deterministic order the API strategy produces
+        # (git tree order approximated by lexicographic sort).
+        files.sort(key=lambda f: f.path)
+        logger.info("Fetched %d files via git clone from %s", len(files), repo.full_name)
+        return files
+
+    # ── API-based strategy (fallback) ─────────────────────────────────────────
+
+    def _walk_tree_via_api(
+        self,
+        repo: Repository,
+        on_tree: Callable[[int], None] | None = None,
+        on_file: Callable[[], None] | None = None,
+    ) -> list[FileNode]:
+        """Walk the repository tree recursively and collect all relevant files.
+
+        Uses the GitHub Blobs API with a thread pool for parallel downloads.
+        This is the fallback strategy when ``git clone`` is not available.
+        """
         binary_exts = self.config.binary_extensions_set
         skip_dirs = self.config.skip_directories_set
         max_bytes = self.config.max_file_size_kb * 1024
@@ -263,9 +437,6 @@ class GithubFetcher:
             on_tree(len(eligible))
 
         # Fetch file contents in parallel using the Git Blobs API.
-        # The tree already provides each blob's SHA, so we call
-        # get_git_blob(sha) directly instead of get_contents(path) — this
-        # avoids an extra path-resolution step on GitHub's side.
         files: list[FileNode] = []
 
         def _fetch_blob(item: Any) -> FileNode | None:

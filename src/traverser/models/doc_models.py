@@ -22,6 +22,7 @@ class ImportInfo(BaseModel):
     symbols: list[str] = Field(default_factory=list)
     is_relative: bool = False
     alias: str | None = None
+    level: int = Field(default=0, description="Number of leading dots in a Python relative import")
 
 
 class FunctionInfo(BaseModel):

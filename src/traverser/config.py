@@ -139,8 +139,39 @@ class Config(BaseSettings):
     )
 
     @model_validator(mode="after")
-    def _check_api_key_present(self) -> "Config":
-        """Warn if the selected provider has no API key — fail at use time, not import time."""
+    def _auto_detect_provider(self) -> Config:
+        """Auto-select the LLM provider based on which API keys are available.
+
+        When ``LLM_PROVIDER`` is not explicitly configured (i.e. it is still at
+        the hard-coded default of ``openai``) but the OpenAI key is absent, we
+        fall back to the first provider whose key *is* present in the environment.
+        This prevents confusing "API key required" errors when the user has only
+        set, say, ``ANTHROPIC_API_KEY`` in their ``.env`` file.
+
+        Priority order when auto-detecting: openai → anthropic
+        (github-copilot never needs an API key so it is not auto-selected here;
+        users must set ``LLM_PROVIDER=github-copilot`` explicitly).
+        """
+        # Nothing to do when a key is already available for the current provider.
+        if self.llm_provider == LLMProvider.OPENAI and self.openai_api_key:
+            return self
+        if self.llm_provider == LLMProvider.ANTHROPIC and self.anthropic_api_key:
+            return self
+        if self.llm_provider == LLMProvider.GITHUB_COPILOT:
+            return self
+
+        # Try to find an available provider.
+        if self.openai_api_key:
+            object.__setattr__(self, "llm_provider", LLMProvider.OPENAI)
+            return self
+        if self.anthropic_api_key:
+            object.__setattr__(self, "llm_provider", LLMProvider.ANTHROPIC)
+            if self.llm_model == "gpt-4o":
+                # Switch away from the OpenAI default model.
+                object.__setattr__(self, "llm_model", "claude-3-5-sonnet-20241022")
+            return self
+
+        # No key found — leave as-is; require_api_key() will give a clear error.
         return self
 
     # ── Derived helpers ───────────────────────────────────────────────────────
